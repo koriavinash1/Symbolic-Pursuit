@@ -226,12 +226,12 @@ class SymbolicClassifier:
             for ii in range(self.nclasses):
                 Y = w_ * meijer_g_.evaluate(self.forward(X, vs_[ii]))
                 Ys.append(Y)
-            Ys = np.array(Ys).T
+            Ys = softmax(np.array(Ys).T, 1)
 
             # FIXME: new loss function
             # loss_ = np.mean((Y - residual_list) ** 2)
             loss_ = np.mean(self.residual(residual_list, np.array(Ys), 'NLL'))
-            print("Loss: ", loss_)
+            # print("Loss: ", loss_)
             return loss_
 
         new_theta, new_loss = self.optimize_CG(loss, theta_0)
