@@ -1,4 +1,7 @@
 from pysymbolic.models.special_functions import MeijerG
+from scipy.optimize import LinearConstraint
+from scipy.optimize import basinhopping
+from itertools import combinations 
 from scipy.optimize import minimize
 from scipy.special import softmax
 from sympy import Symbol, sympify
@@ -63,6 +66,7 @@ class SymbolicClassifier:
                         random_seed=42):
         self.dim_x = 0  # Number of features
         self.n_points = 0  # Number of points
+        self.alpha = 1. # residual weightage
         self.current_resi = np.array(self.n_points)  # Array of residues
         self.loss_list = []  # List of residual losses associated to each term
         self.terms_list = []  # List of all the terms in the model
@@ -87,12 +91,18 @@ class SymbolicClassifier:
 
     # Optimizer
 
-    def optimize_CG(self, loss, theta_0):
+    def optimize_CG(self, loss, theta_0, linear_constraint):
         # Encodes the parameters of the optimal parameters 
         # of an additional term inside theta_opt
-        opt = minimize(loss, theta_0, method='CG',
-                       options={'disp': self.verbosity, 
-                                'maxiter': self.maxiter})
+        minimizer_kwargs = {'method': 'CG',
+                            'constraints': [linear_constraint]}
+        opt = basinhopping(loss, theta_0, minimizer_kwargs=minimizer_kwargs,
+                            niter=self.maxiter,
+                            disp = self.verbosity)
+        # opt = minimize(loss, theta_0, method='CG',
+        #                constraints=[linear_constraint],
+        #                options={'disp': self.verbosity, 
+        #                         'maxiter': self.maxiter})
         theta_opt = opt.x
         loss_ = opt.fun
         return theta_opt, loss_
@@ -136,27 +146,37 @@ class SymbolicClassifier:
         proj_list = []
         for k in range(len(self.terms_list)):
             _, vk, _ = self.terms_list[k]
-            symbol_k = 0
-            for j in range(self.dim_x):
-                symbol_k += vk[j] * Symbol("X" + str(j + 1))
-            proj_list.append(symbol_k)
+            v_ks = [vk[i*self.dim_x: (i+1)*self.dim_x] for i in range(self.nclasses)]
+            class_proj_list = []
+
+            for vk in v_ks: 
+                symbol_k = 0
+                for j in range(self.dim_x):
+                    symbol_k += vk[j] * Symbol("X" + str(j + 1))
+                class_proj_list.append(symbol_k)
+            proj_list.append(class_proj_list)
         return proj_list
 
 
     def string_projections(self):
         # Returns a string containing all projections
-        proj_str = ""
+        proj_strs = []
         proj_list = self.get_projections()
-        for k in range(len(proj_list)):
-            proj_str += "P" + str(k + 1) + " = " + str(proj_list[k]) + "\n"
-        return proj_str
+        for ck in range(len(proj_list)):
+            proj_str = ""
+            for k in range(len(proj_list[ck])):
+                proj_str += "P" + str(k + 1) + " = " + str(proj_list[ck][k]) + "\n"
+            proj_strs.append(proj_str)
+        return proj_strs
 
 
     def print_projections(self):
         # Prints the projections appearing in the symbolic expression
         proj_list = self.get_projections()
-        for k in range(len(proj_list)):
-            print("P" + str(k + 1) + " = ", proj_list[k])
+        for ck in range(len(proj_list)):
+            for k in range(len(proj_list[ck])):
+                print ("expression for class {}".format(k)) 
+                print("P" + str(k + 1) + " = ", proj_list[ck][k])
 
 
     def get_taylor(self, x0, approx_order):
@@ -190,14 +210,15 @@ class SymbolicClassifier:
             g_k, v_k, w_k = self.terms_list[k]
             v_ks = [v_k[i*self.dim_x: (i+1)*self.dim_x] for i in range(self.nclasses)]
             prediction = self.predict(x0[None, ...])
-            print (prediction)
             v_k = v_ks[np.argmax(prediction)]
             x_k = np.dot(v_k, x0) / (np.sqrt(self.dim_x) * np.linalg.norm(v_k))
+
             if x_k > 0:
                 coef_k = mpmath.chop(mpmath.taylor(g_k.math_expr, x_k, 1))
                 for n in range(self.dim_x):
                     importance_list[n] += sympify(
                         w_k * coef_k[1] * v_k[n] / (np.sqrt(self.dim_x) * np.linalg.norm(v_k)))
+
         return importance_list
 
 
@@ -206,9 +227,10 @@ class SymbolicClassifier:
     def tune_new_term(self, X, g_order, theta_0):
         # Tunes a new term for the model for f with a Meijer G-function of order g_order
 
+        _, _, p, q = g_order
+
         def split_theta(theta):
             # Splits theta in the Meijer G-function part, the vector part and the weight part
-            _, _, p, q = g_order
             theta_g = np.concatenate((theta[:p + q], np.array([1.0])))
             theta_vs = theta[p + q:-1]
             theta_w = theta[-1]
@@ -234,7 +256,24 @@ class SymbolicClassifier:
             # print("Loss: ", loss_)
             return loss_
 
-        new_theta, new_loss = self.optimize_CG(loss, theta_0)
+        # perpendicularity conditions
+        index = np.arange(self.nclasses)
+        cmb_idxs = list(combinations(index, 2))
+        contrainMatrix = np.zeros((len(cmb_idxs), len(theta_0)))
+
+        for ii, cmb_idx in enumerate(cmb_idxs):
+            # print (contrainMatrix.shape, p + q + cmb_idx[0]*self.dim_x, p + q + (cmb_idx[0] + 1)*self.dim_x)
+            # print (theta_0.shape, p + q + cmb_idx[1]*self.dim_x, p + q + (cmb_idx[1] + 1)*self.dim_x)
+            contrainMatrix[ii][p + q + cmb_idx[0]*self.dim_x : p + q + (cmb_idx[0] + 1)*self.dim_x] = \
+                                theta_0[p + q + cmb_idx[1]*self.dim_x : p + q + (cmb_idx[1] + 1)*self.dim_x]    
+
+
+        # FIXME 
+        lefteq = np.ones(len(cmb_idxs))*(-np.inf) 
+        righteq = np.zeros(len(cmb_idxs))
+        linear_constraint = LinearConstraint(contrainMatrix, lefteq, righteq)
+
+        new_theta, new_loss = self.optimize_CG(loss, theta_0, linear_constraint)
         new_theta_meijer, new_vs, new_w = split_theta(new_theta)
         new_meijerg = MeijerG(theta=new_theta_meijer, order=g_order)
         return new_meijerg, new_vs, new_w, new_loss
@@ -243,7 +282,7 @@ class SymbolicClassifier:
     def residual(self, true, pred, type_='L1'):
         # Default: true - pred
         if type_ == 'L1':
-            return np.abs(true - pred)
+            return np.abs(true - self.alpha*pred)
 
         elif type_ == 'L2':
             return np.abs(true - pred)**2
@@ -261,7 +300,7 @@ class SymbolicClassifier:
             # effective loss would be -log_prob*advantage
             
             log_prob = np.log(pred + EPS)
-            log_prob = -1.*log_prob*true
+            log_prob = -1.*np.sum(log_prob*true, axis=1)
             return log_prob
 
 
@@ -275,7 +314,7 @@ class SymbolicClassifier:
         w0 = 1.0
         count = 0
         Y_target = f(X)
-        current_loss = np.mean(Y_target ** 2)
+        current_loss = 10000.0
         
         self.loss_list.append(current_loss)
         while current_loss > loss_tol:
@@ -353,9 +392,10 @@ class SymbolicClassifier:
             if self.verbosity:
                 print(100 * "=")
                 print("Now backfitting term number ", k + 1, ".")
-            self.current_resi = f(X) - self.predict(X, exclude_term=True, exclusion_id=k)
+            self.current_resi = self.residual(f(X), self.predict(X, exclude_term=True, exclusion_id=k), 'L1')
             meijer_g0, v0, w0 = self.terms_list[k]
             theta_meijer0 = meijer_g0.theta[:-1]
+
             theta0 = np.concatenate((theta_meijer0, v0, [w0]))
             g_order = meijer_g0.order
             new_meijerg, new_v, new_w, new_loss = self.tune_new_term(X, g_order, theta0)
