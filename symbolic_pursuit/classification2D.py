@@ -63,6 +63,7 @@ class SymbolicClassifier2D:
                         nclasses=10, 
                         maxiter=100,
                         eps=1.0e-5, 
+                        global_opt=False,
                         random_seed=42):
         self.dim_x = [0, 0]  # Number of features
         self.n_points = 0  # Number of points
@@ -76,6 +77,7 @@ class SymbolicClassifier2D:
         self.loss_tol = loss_tol  # The tolerance for the loss under which the pursuit stops
         self.maxiter = maxiter  # Maximum number of iterations for optimization
         self.nclasses = nclasses
+        self.global_opt = global_opt
         self.eps = eps  # Small number used for numerical stability
         if self.verbosity:
             print('Model created with the following hyperparameters :'
@@ -94,35 +96,61 @@ class SymbolicClassifier2D:
     def optimize_CG(self, loss, theta_0, linear_constraint):
         # Encodes the parameters of the optimal parameters 
         # of an additional term inside theta_opt
-        minimizer_kwargs = {'method': 'CG',
-                            # 'jac' : '2-point',
-                            # 'hess': '2-point',
 
-                            'options': {'disp': self.verbosity,
-                                        'gtol': 1e-2,
-                                        'maxiter': self.maxiter,
-                                        'eps': 0.1,
-                                        },
-                            'constraints': [linear_constraint]}
-        opt = basinhopping(loss, theta_0, 
-                            minimizer_kwargs=minimizer_kwargs,
-                            niter=self.maxiter,
-                            stepsize=1.,
-                            niter_success= 3,
-                            disp = self.verbosity)
-        # opt = minimize(loss, theta_0, method='CG',
-        #                constraints=[linear_constraint],
-        #                options={'disp': self.verbosity, 
-        #                         'maxiter': self.maxiter})
+        if self.global_opt:
+            minimizer_kwargs = {'method': 'CG',
+                                # 'jac' : '2-point',
+                                # 'hess': '2-point',
+
+                                'options': {'disp': self.verbosity,
+                                            'gtol': 0.9e-2,
+                                            'maxiter': self.maxiter,
+                                            'eps': 2./self.count,
+                                            },
+                                'constraints': [linear_constraint]}
+            opt = basinhopping(loss, theta_0, 
+                                minimizer_kwargs=minimizer_kwargs,
+                                niter=self.maxiter,
+                                stepsize=1.,
+                                niter_success= 3,
+                                disp = self.verbosity)
+        else:
+            opt = minimize(loss, theta_0, method='CG',
+                       constraints=[linear_constraint],
+                       options={'disp': self.verbosity, 
+                                'gtol': 0.1,
+                                'eps' : 2./self.count, 
+                                'maxiter': self.maxiter})
         theta_opt = opt.x
         loss_ = opt.fun
         return theta_opt, loss_
 
+
     def forward(self, X, V, U):
         D = np.abs([np.max(np.linalg.eig(x)[0]) for x in X])
-        vec = ReLU(np.matmul(np.matmul(X, V), U)
-                    / (np.sqrt(D) * np.linalg.norm(V) * np.linalg.norm(U)))
+        vec = np.matmul(np.matmul(X, V), U) \
+                    / (np.sqrt(D) * np.linalg.norm(V) * np.linalg.norm(U))
+        if isinstance(vec, np.float64):
+            vec = vec if abs(vec) > self.eps else self.eps
+        else:
+            vec[np.abs(vec) < self.eps] = self.eps
         return vec
+
+    def split_vks(self, vk):
+        vs = [vk[i*self.dim_x[0]: (i+1)*self.dim_x[0]] for i in range(self.nclasses)]
+        offset = self.nclasses*self.dim_x[0]
+        us = [vk[offset + i*self.dim_x[1]: offset + (i+1)*self.dim_x[1]] for i in range(self.nclasses)]
+
+        return vs, us
+
+
+    def split_theta_gs(self, theta_gs):
+        pq = len(theta_gs)/self.nclasses 
+
+        pq = int(pq)
+        theta_gs = [np.concatenate((theta_gs[i*pq: (i+1)*pq], np.array([1.0]))) for i in range(self.nclasses)]
+        return theta_gs
+
 
     # Extract information from the model
 
@@ -135,24 +163,26 @@ class SymbolicClassifier2D:
             index_list.pop(exclusion_id)
         
         for k in index_list:
-            meijer_g, vs, w = self.terms_list[k]
-            vs = [vs[i*self.dim_x[0]: (i+1)*self.dim_x[0]] for i in range(self.nclasses)]
-            offset = self.nclasses*self.dim_x[0]
-            us = [vs[offset + i*self.dim_x[1]: offset + (i+1)*self.dim_x[1]] for i in range(self.nclasses)]
+            meijer_gs, vs, ws = self.terms_list[k]
+            vks, uks = self.split_vks(vs)
             for ii in range(self.nclasses):
-                result[:,ii] = result[:,ii] + w * meijer_g.evaluate(self.forward(X, vs[ii], us[ii]))
+                result[:,ii] = result[:,ii] + w[ii] * meijer_gs[ii].evaluate(self.forward(X, vs[ii], us[ii]))
+
         return softmax(result, 1)
 
 
     def get_expression(self):
         # Returns the symbolic expression of the model
-        expression = 0
-        for k in range(len(self.terms_list)):
-            meijer_gk, _, w_k = self.terms_list[k]
-            argument_str = "[ReLU(P" + str(k + 1) + ")]"
-            argument_symbol = Symbol(argument_str)
-            expression += w_k * meijer_gk.expression(x=argument_symbol)
-        return expression
+        expressions = []
+        for i in range(self.nclasses):
+            expression = 0
+            for k in range(len(self.terms_list)):
+                meijer_gks, _, w_ks = self.terms_list[k]
+                argument_str = "[ReLU(P" + str(k + 1) + ")]"
+                argument_symbol = Symbol(argument_str)
+                expression += w_ks[i] * meijer_gks[i].expression(x=argument_symbol)
+            expressions.append(expression)
+        return expressions
 
 
     def get_projections(self):
@@ -160,9 +190,7 @@ class SymbolicClassifier2D:
         proj_list = []
         for k in range(len(self.terms_list)):
             _, vs, _ = self.terms_list[k]
-            vks = [vs[i*self.dim_x[0]: (i+1)*self.dim_x[0]] for i in range(self.nclasses)]
-            offset = self.nclasses*self.dim_x[0]
-            uks = [vs[offset + i*self.dim_x[1]: offset + (i+1)*self.dim_x[1]] for i in range(self.nclasses)]
+            vks, uks = self.split_vks(vs)
             class_proj_list = []
 
             for vk, uk in zip(vks, uks): 
@@ -203,25 +231,22 @@ class SymbolicClassifier2D:
         lambda_ = np.max(np.linalg.eig(x0)[0])
 
         for k in range(len(self.terms_list)):
-            g_k, v_k, w_k = self.terms_list[k]
+            g_ks, v_ks, w_ks = self.terms_list[k]
 
-            v_ks = [v_k[i*self.dim_x[0]: (i+1)*self.dim_x[0]] for i in range(self.nclasses)]
-            offset = self.nclasses*self.dim_x[0]
-            u_ks = [v_k[offset + i*self.dim_x[1]: offset + (i+1)*self.dim_x[1]] for i in range(self.nclasses)]
-
+            v_ks, u_ks = self.split_vks(v_ks)
 
             x_ks = np.array([self.forward(x0, v_k, u_k) for v_k, u_k in zip(v_ks, u_ks)])
 
             v_k = v_ks[np.argmax(x_ks)]
             u_k = u_ks[np.argmax(x_ks)]
-            x_k = max(self.eps, np.argmax(x_ks))
+            w_k = w_ks[np.argmax(x_ks)]
+            x_k = max(x_ks)
 
-            if x_k > 0:
-                coef_k = mpmath.chop(mpmath.taylor(g_k.math_expr, x_k, 1))
-                for ii in range(self.dim_x[0]):
-                    for jj in range(self.dim_x[1]):
-                        importance_list[ii, jj] += sympify(
-                            w_k * coef_k[1] * v_k[ii] * u_k[jj]/ (lambda_ * np.linalg.norm(u_k) * np.linalg.norm(v_k)))
+            coef_k = mpmath.chop(mpmath.taylor(g_k.math_expr, x_k, 1))
+            for ii in range(self.dim_x[0]):
+                for jj in range(self.dim_x[1]):
+                    importance_list[ii, jj] += sympify(
+                        w_k * coef_k[1] * v_k[ii] * u_k[jj]/ (lambda_ * np.linalg.norm(u_k[jj]) * np.linalg.norm(v_k[ii])))
 
         return importance_list
 
@@ -235,28 +260,26 @@ class SymbolicClassifier2D:
 
         def split_theta(theta):
             # Splits theta in the Meijer G-function part, the vector part and the weight part
-            theta_g = np.concatenate((theta[:p + q], np.array([1.0])))
-            theta_vs = theta[p + q:p + q + self.nclasses*self.dim_x[0]]
-            theta_us = theta[p + q + self.nclasses*self.dim_x[0]:-1]
-            theta_w = theta[-1]
-            return theta_g, theta_vs, theta_us, theta_w
+            theta_gs = theta[:(p+q)*self.nclasses]
+            theta_vs = theta[(p + q)*self.nclasses:-self.nclasses]
+            theta_ws = theta[-self.nclasses:]
+            return theta_gs, theta_vs, theta_ws
+
 
         def loss(theta):
             # Computes the loss for a new term of parameter theta
             residual_list = self.current_resi
-            theta_g, vs_, us_, w_ = split_theta(theta)
+            theta_gs, vs_, ws_ = split_theta(theta)
+            theta_gs = self.split_theta_gs(theta_gs)
+            vs_, us_ = self.split_vks(vs_)
 
-            vs_ = [vs_[i*self.dim_x[0]: (i+1)*self.dim_x[0]] for i in range(self.nclasses)]
-            us_ = [us_[i*self.dim_x[1]: (i+1)*self.dim_x[1]] for i in range(self.nclasses)]
-            meijer_g_ = MeijerG(theta=theta_g, order=g_order)
-
+            meijer_gs_ = [MeijerG(theta=theta_g, order=g_order) for theta_g in theta_gs]
             Ys = []
-
             for ii in range(self.nclasses):
-                Y = w_ * meijer_g_.evaluate(self.forward(X, vs_[ii], us_[ii]))
+                Y = ws_[ii] * meijer_gs_[ii].evaluate(self.forward(X, vs_[ii], us_[ii]))
                 Ys.append(Y)
-
             Ys = softmax(np.array(Ys).T, 1)
+
 
             # loss_ = np.mean((Y - residual_list) ** 2)
             loss_ = np.mean(self.residual(residual_list, np.array(Ys), 'NLL'))
@@ -270,15 +293,11 @@ class SymbolicClassifier2D:
 
         for ii, cmb_idx in enumerate(cmb_idxs):
             contrainMatrix[ii][p + q + cmb_idx[0]*self.dim_x[0] : p + q + (cmb_idx[0] + 1)*self.dim_x[0]] = \
-                                theta_0[p + q + cmb_idx[1]*self.dim_x[0] : p + q + (cmb_idx[1] + 1)*self.dim_x[0]] / \
-                                (np.linalg.norm(theta_0[p + q + cmb_idx[1]*self.dim_x[0] : p + q + (cmb_idx[1] + 1)*self.dim_x[0]]) *\
-                                    np.linalg.norm(theta_0[p + q + cmb_idx[0]*self.dim_x[0] : p + q + (cmb_idx[0] + 1)*self.dim_x[0]]))
+                                theta_0[p + q + cmb_idx[1]*self.dim_x[0] : p + q + (cmb_idx[1] + 1)*self.dim_x[0]] 
 
             offset = p + q + self.nclasses*self.dim_x[0] 
             contrainMatrix[ii][offset + cmb_idx[0]*self.dim_x[1] : offset + (cmb_idx[0] + 1)*self.dim_x[1]] = \
-                        theta_0[offset + cmb_idx[1]*self.dim_x[1] : offset + (cmb_idx[1] + 1)*self.dim_x[1]] / \
-                            (np.linalg.norm(theta_0[offset + cmb_idx[1]*self.dim_x[1] : offset + (cmb_idx[1] + 1)*self.dim_x[1]]) *\
-                            np.linalg.norm(theta_0[offset + cmb_idx[0]*self.dim_x[1] : offset + (cmb_idx[0] + 1)*self.dim_x[1]]))
+                        theta_0[offset + cmb_idx[1]*self.dim_x[1] : offset + (cmb_idx[1] + 1)*self.dim_x[1]] 
 
 
         # FIXME 
@@ -286,9 +305,10 @@ class SymbolicClassifier2D:
         linear_constraint = LinearConstraint(contrainMatrix, lefteq, righteq)
 
         new_theta, new_loss = self.optimize_CG(loss, theta_0, linear_constraint)
-        new_theta_meijer, new_vs, new_us, new_w = split_theta(new_theta)
-        new_meijerg = MeijerG(theta=new_theta_meijer, order=g_order)
-        return new_meijerg, new_vs, new_us, new_w, new_loss
+        new_theta_gs, new_vs, new_ws = split_theta(new_theta)
+        new_theta_meijers = self.split_theta_gs(new_theta_gs)
+        new_meijergs = [MeijerG(theta=new_theta_meijer, order=g_order) for new_theta_meijer in new_theta_meijers]
+        return new_meijergs, new_vs, new_ws, new_loss
 
 
     def residual(self, true, pred, type_='L1'):
@@ -316,7 +336,7 @@ class SymbolicClassifier2D:
             return log_prob
 
 
-    def fit(self, f, X):
+    def fit(self, f, X, nmax=-1):
         # Fits a model for f via a projection pursuit strategy
         self.n_points = len(X)
         self.dim_x = X[0].shape
@@ -330,7 +350,12 @@ class SymbolicClassifier2D:
         
         self.loss_list.append(current_loss)
         while current_loss > loss_tol:
+            if nmax > 0:
+                if nmax <= count:
+                    break
             count += 1
+            self.count = count
+
             new_loss_list = []
             new_terms_list = []
 
@@ -355,11 +380,12 @@ class SymbolicClassifier2D:
                 v0 = v0s.reshape(-1)
                 u0 = u0s.reshape(-1)
 
-                theta_0 = np.concatenate((theta_g0, v0, u0, [w0]))
+                theta_0 = np.concatenate((theta_g0.tolist()*self.nclasses, v0, u0, [w0]*self.nclasses))
 
-                new_meijer_g, new_v, new_u, new_w, new_loss = self.tune_new_term(X, g_order, theta_0)
+                new_meijer_g, new_v, new_w, new_loss = self.tune_new_term(X, g_order, theta_0)
                 new_loss_list.append(new_loss)
-                new_terms_list.append([new_meijer_g, new_v, new_u, new_w])
+
+                new_terms_list.append([new_meijer_g, new_v, new_w])
 
                 if new_loss < loss_tol:
                     print(100 * "=")
@@ -410,12 +436,14 @@ class SymbolicClassifier2D:
             meijer_g0, v0, w0 = self.terms_list[k]
             theta_meijer0 = meijer_g0.theta[:-1]
 
-            theta0 = np.concatenate((theta_meijer0, v0, [w0]))
-            g_order = meijer_g0.order
+            theta0 = np.concatenate((theta_meijer0, v0, w0))
+            g_order = meijer_g0[0].order
+
             new_meijerg, new_v, new_w, new_loss = self.tune_new_term(X, g_order, theta0)
             if new_loss < self.loss_list[-1]:
                 self.terms_list[k] = [new_meijerg, new_v, new_w]
                 self.loss_list[-1] = new_loss
+
         if self.verbosity:
             print(100 * "=")
             print("Backfitting complete.")

@@ -1,3 +1,6 @@
+from sklearn.datasets import (load_iris, 
+                              load_breast_cancer, 
+                              load_wine)
 
 import numpy as np
 import pandas as pd
@@ -364,12 +367,29 @@ def GetDataset(name, base_path):
         data = data.dropna(axis=1)
         X = data.iloc[:, 0:100].values
         y = data.iloc[:, 100].values
+        
+    
+    if name=='iris':
+        iris = load_iris()
+        X = iris['data']
+        y = iris['target']
+
+        
+    if name=='wine-classification':
+        wine = load_wine()
+        X = wine['data']
+        y = wine['target']
+
+        
+    if name=='breast-cancer':
+        breast = load_breast_cancer()
+        X = breast['data']
+        y = breast['target']  
+        
 
         
     X = X.astype(np.float32)
     y = y.astype(np.float32)
-
-
 
     
     return X, y
