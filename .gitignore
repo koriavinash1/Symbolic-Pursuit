@@ -1,3 +1,6 @@
 *.png
 EXPLogs/
 EXPLogs/*
+*.idea*
+*.ipynb_checkpoints*
+*.Rhistory
