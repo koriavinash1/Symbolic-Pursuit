@@ -3,7 +3,9 @@ import csv
 import pickle
 from symbolic_pursuit.models import SymbolicRegressor
 from datasets.data_loader_UCI import data_loader, mixup
-from experiments.train_model import train_model
+from experiments.train_model import (train_model, 
+                                        simple_CNNmodel, 
+                                        simple_1Dmodel, train_keras_model)
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics import r2_score
 from time import strftime, gmtime
@@ -66,7 +68,9 @@ if __name__ == '__main__':
     X_train, y_train, X_test, y_test = data_loader(dataset_name, random_seed=random_seed, test_ratio=test_ratio)
     X_mixup = mixup(X_train, random_seed=random_seed)
     if model is None:
-        model = train_model(X_train, y_train, black_box=model_type, random_seed=random_seed)
+        if model_type == 'keras':
+        else:
+            model = train_model(X_train, y_train, black_box=model_type, random_seed=random_seed)
     else:
         model_type = model.__class__.__name__
     symbolic_model = SymbolicRegressor(verbosity=verbosity, loss_tol=loss_tol, ratio_tol=ratio_tol,

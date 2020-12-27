@@ -5,6 +5,7 @@ from itertools import combinations
 from scipy.optimize import minimize
 from scipy.special import softmax
 from sympy import Symbol, sympify
+from threading import Thread
 import mpmath
 import numpy as np
 
@@ -226,6 +227,7 @@ class SymbolicClassifier:
                 print("P" + str(k + 1) + " = ", proj_list[ck][k])
 
 
+
     def get_taylor(self, x0, approx_order):
         # Returns the Taylor expansion around x0 of order approx_order for our model
         expression = 0
@@ -276,17 +278,19 @@ class SymbolicClassifier:
             coef_k = mpmath.chop(mpmath.taylor(g_k.math_expr, x_k, 1))
             for n in range(self.dim_x):
                 importance_list[n] += sympify(
-                    w_k * coef_k[1] * v_k[n] / (np.sqrt(self.dim_x) * np.linalg.norm(v_k[n])))
+                    w_k * coef_k[1] * v_k[n] / (np.sqrt(self.dim_x) * np.linalg.norm(v_k)))
 
         return importance_list
 
 
         # Change the model:
 
-    def tune_new_term(self, X, g_order, theta_0):
+    def tune_new_term(self, X, g_order, theta_0, batch_size=10):
         # Tunes a new term for the model for f with a Meijer G-function of order g_order
 
         _, _, p, q = g_order
+        batch_size = batch_size
+        idxs = np.arange(len(X))
 
         def split_theta(theta):
             # Splits theta in the Meijer G-function part, the vector part and the weight part
@@ -298,10 +302,17 @@ class SymbolicClassifier:
 
         def loss(theta):
             # Computes the loss for a new term of parameter theta
-            residual_list = self.current_resi
-            theta_gs, vs_, ws_ = split_theta(theta)
 
+            # create random batch
+            batch_idxs = np.random.choice(idxs, batch_size) 
+            x_batch = X[batch_idxs]
+            residual_list = self.current_resi[batch_idxs]
+
+
+            theta_gs, vs_, ws_ = split_theta(theta)
             theta_gs = self.split_theta_gs(theta_gs)
+
+
             vs_ = self.split_vks(vs_)
 
             meijer_gs_ = [MeijerG(theta=theta_g, order=g_order) for theta_g in theta_gs]
@@ -309,7 +320,7 @@ class SymbolicClassifier:
 
             Ys = []
             for ii in range(self.nclasses):
-                Y = ws_[ii] * meijer_gs_[ii].evaluate(self.forward(X, vs_[ii]))
+                Y = ws_[ii] * meijer_gs_[ii].evaluate(self.forward(x_batch, vs_[ii]))
                 Ys.append(Y)
             Ys = softmax(np.array(Ys).T, 1)
 
@@ -335,6 +346,7 @@ class SymbolicClassifier:
         # FIXME 
         lefteq = righteq = np.zeros(len(cmb_idxs))
         linear_constraint = LinearConstraint(contrainMatrix, lefteq, righteq)
+        
 
         new_theta, new_loss = self.optimize_CG(loss, theta_0, linear_constraint)
         new_theta_gs, new_vs, new_ws = split_theta(new_theta)
@@ -343,10 +355,12 @@ class SymbolicClassifier:
         return new_meijergs, new_vs, new_ws, new_loss
 
 
+
+
     def residual(self, true, pred, type_='L1'):
         # Default: true - pred
         if type_ == 'L1':
-            return np.abs(true - self.alpha*pred)
+            return (true * self.alpha*pred)
 
         elif type_ == 'L2':
             return np.abs(true - pred)**2
@@ -368,14 +382,35 @@ class SymbolicClassifier:
             return log_prob
 
 
-    def fit(self, f, X, nmax=-1):
+    def worker(self, hyperparameter, X, index, batch_size):
+        if self.verbosity:
+            print(100 * "=")
+            print("Worker Index: {}; Now working on hyperparameter tree: {}.".format(index, hyperparameter))
+    
+
+        theta_g0, g_order = hyperparameter
+        v0 = self.v0s.reshape(-1)
+
+        theta_0 = np.concatenate((theta_g0.tolist()*self.nclasses, v0, self.w0s))
+
+        new_meijer_g, new_v, new_w, new_loss = self.tune_new_term(X, g_order, theta_0, batch_size)
+
+        if self.verbosity:
+            print("Worker Index: {}; Current loss: {}.".format(index, new_loss))
+    
+
+        self.new_loss_list[index]= new_loss
+        self.new_terms_list[index] = [new_meijer_g, new_v, new_w]
+
+  
+
+    def fit(self, f, X, nmax=-1, batch_size = 10):
         # Fits a model for f via a projection pursuit strategy
         self.n_points = len(X)
         self.dim_x = len(X[0])
         h_dic = load_h()
         loss_tol = self.loss_tol
 
-        w0 = 1.0
         count = 0
         Y_target = f(X)
         current_loss = 10000.0
@@ -389,12 +424,11 @@ class SymbolicClassifier:
             count += 1
             self.count = count
             
-            new_loss_list = []
-            new_terms_list = []
 
             np.random.seed(self.random_seed)
 
-            v0s = np.array([np.random.randn(self.dim_x) for _ in range(self.nclasses)])
+            self.w0s = np.array([np.random.randn() for _ in range(self.nclasses)])
+            self.v0s = np.array([np.random.randn(self.dim_x) for _ in range(self.nclasses)])
             self.current_resi = self.residual(Y_target, self.predict(X), 'L1')
 
 
@@ -403,31 +437,23 @@ class SymbolicClassifier:
                 print("Now working on term number ", count, ".")
             
 
+            self.new_loss_list = [None]*len(h_dic)
+            self.new_terms_list = [None]*len(h_dic)
+            threads = [None]*len(h_dic)
+
+
             for k in range(len(h_dic)):
-                if self.verbosity:
-                    print(100 * "=")
-                    print("Now working on hyperparameter tree number ", k + 1, ".")
-            
+                self.worker(h_dic['hyper_' + str(k + 1)], X, k, batch_size=batch_size)
+            #     threads[k] = Thread(target=self.worker, args=(h_dic['hyper_' + str(k + 1)], X, k))
+            #     threads[k].start()
 
-                theta_g0, g_order = h_dic['hyper_' + str(k + 1)]
-                v0 = v0s.reshape(-1)
-
-                theta_0 = np.concatenate((theta_g0.tolist()*self.nclasses, v0, [w0]*self.nclasses))
-
-                new_meijer_g, new_v, new_w, new_loss = self.tune_new_term(X, g_order, theta_0)
-                new_loss_list.append(new_loss)
-
-                new_terms_list.append([new_meijer_g, new_v, new_w])
+            # for k in range(len(threads)):
+            #     threads[k].join()
 
 
-                if new_loss < loss_tol:
-                    print(100 * "=")
-                    print("The algorithm stopped because the desired precision was achieved.")
-                    break
-
-            best_index = np.argmin(np.array(new_loss_list))
-            best_term = new_terms_list[int(best_index)]
-            best_loss = new_loss_list[int(best_index)]
+            best_index = np.argmin(np.array(self.new_loss_list))
+            best_term = self.new_terms_list[int(best_index)]
+            best_loss = self.new_loss_list[int(best_index)]
 
 
             if best_loss / current_loss < self.ratio_tol:
@@ -436,7 +462,7 @@ class SymbolicClassifier:
                 if self.verbosity:
                     print(100 * "=")
                     print("The tree number ", best_index + 1, " was selected as the best.")
-                self.backfit(f, X)
+                self.backfit(f, X, batch_size)
                 current_loss = self.loss_list[-1]
             else:
                 print(100 * "=")
@@ -460,7 +486,7 @@ class SymbolicClassifier:
         print(100 * "-")
 
 
-    def backfit(self, f, X):
+    def backfit(self, f, X, batch_size):
         # The backfitting procedure invoked at each iteration of fit to correct the previous terms
         for k in range(len(self.terms_list) - 1):
             if self.verbosity:
@@ -469,12 +495,15 @@ class SymbolicClassifier:
             self.current_resi = self.residual(f(X), self.predict(X, exclude_term=True, exclusion_id=k), 'L1')
             meijer_g0, v0, w0 = self.terms_list[k]
 
-            theta_meijer0 = [meijer_.theta[:-1] for meijer_ in meijer_g0]
+            theta_meijer0 = []
+            for meijer_ in meijer_g0:
+                theta_meijer0.extend(meijer_.theta[:-1])
+
 
             theta0 = np.concatenate((theta_meijer0, v0, w0))
             g_order = meijer_g0[0].order
 
-            new_meijerg, new_v, new_w, new_loss = self.tune_new_term(X, g_order, theta0)
+            new_meijerg, new_v, new_w, new_loss = self.tune_new_term(X, g_order, theta0, batch_size)
             if new_loss < self.loss_list[-1]:
                 self.terms_list[k] = [new_meijerg, new_v, new_w]
                 self.loss_list[-1] = new_loss

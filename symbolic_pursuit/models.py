@@ -81,9 +81,10 @@ class SymbolicRegressor:
 
     def optimize_CG(self, loss, theta_0):
         # Encodes the parameters of the optimal parameters of an additional term inside theta_opt
-        opt = minimize(loss, theta_0, method='CG',
+        opt = minimize(loss, theta_0, method='BFGS',
                        options={'disp': self.verbosity, 'maxiter': self.maxiter})
         theta_opt = opt.x
+        print (theta_opt)
         loss_ = opt.fun
         return theta_opt, loss_
 
@@ -172,6 +173,8 @@ class SymbolicRegressor:
 
     def tune_new_term(self, X, g_order, theta_0):
         # Tunes a new term for the model for f with a Meijer G-function of order g_order
+        batch_size = 20
+        idxs = np.arange(len(X))
 
         def split_theta(theta):
             # Splits theta in the Meijer G-function part, the vector part and the weight part
@@ -183,10 +186,15 @@ class SymbolicRegressor:
 
         def loss(theta):
             # Computes the loss for a new term of parameter theta
-            residual_list = self.current_resi
+            # create random batch
+            batch_idxs = np.random.choice(idxs, batch_size) 
+            x_batch = X[batch_idxs]
+            residual_list = self.current_resi[batch_idxs]
+
+
             theta_g, v_, w_ = split_theta(theta)
             meijer_g_ = MeijerG(theta=theta_g, order=g_order)
-            Y = w_ * meijer_g_.evaluate(ReLU(np.matmul(X, v_)
+            Y = w_ * meijer_g_.evaluate(ReLU(np.matmul(x_batch, v_)
                                              / (np.sqrt(self.dim_x) * np.linalg.norm(v_))))
 
             loss_ = np.mean((Y - residual_list) ** 2)
